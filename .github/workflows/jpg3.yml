@@ -1,0 +1,177 @@
+name: "📦 دانلودر چندفایلی (کاما یا خطی)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_urls:
+        description: "لیست لینک‌های مستقیم (با کاما یا خط جدید جدا کنید)"
+        required: true
+        type: string
+
+      zip_password:
+        description: "رمز فایل فشرده (خالی = بدون رمز)"
+        required: false
+        default: ""
+        type: string
+
+      max_part_mb:
+        description: "حداکثر حجم هر قطعه (مگابایت)"
+        required: false
+        default: "90"
+        type: string
+
+      upload_method:
+        description: "روش آپلود"
+        required: true
+        default: "repository"
+        type: choice
+        options:
+          - repository
+          - release
+
+      release_tag:
+        description: "تگ ریلیز (برای آپلود در ریلیز)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  batch-download-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y p7zip-full curl
+
+      - name: Prepare URL List (Supports Comma & Newline)
+        shell: bash
+        run: |
+          echo "${{ github.event.inputs.file_urls }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' > urls.txt
+          
+          echo "تعداد لینک‌های دریافتی:"
+          wc -l < urls.txt
+          echo "--- لینک‌ها ---"
+          cat -n urls.txt
+
+      - name: Download All Files
+        id: download
+        shell: bash
+        run: |
+          mkdir -p temp_dl
+          counter=1
+          
+          while IFS= read -r url; do
+            [[ -z "$url" ]] && continue
+            
+            FILENAME=$(basename "$url" | cut -d'?' -f1)
+            
+            if [[ -z "$FILENAME" || ! "$FILENAME" =~ \. ]]; then
+              FILENAME="file_${counter}.jpg"
+            fi
+            
+            FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._() -]/_/g')
+            
+            if [[ -f "temp_dl/$FILENAME" ]]; then
+              FILENAME="${counter}_${FILENAME}"
+            fi
+            
+            echo "[$counter] دانلود: $FILENAME"
+            curl -L --fail --retry 3 \
+              -o "temp_dl/$FILENAME" \
+              "$url" || echo "❌ خطا در دانلود: $url"
+            
+            ((counter++))
+          done < urls.txt
+          
+          echo "downloaded_count=$((counter-1))" >> "$GITHUB_OUTPUT"
+          
+          echo ""
+          echo "📁 فایل‌های دانلود شده:"
+          ls -lh temp_dl/
+
+      - name: Create Split Archive
+        id: archive
+        shell: bash
+        run: |
+          PASS="${{ github.event.inputs.zip_password }}"
+          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
+
+          if [[ -z "$THRESH_MB" || "$THRESH_MB" -le 0 || "$THRESH_MB" -gt 1900 ]]; then
+            THRESH_MB=1800
+          fi
+
+          cd temp_dl || exit 1
+
+          ARCHIVE_BASE="batch_$(date +%Y%m%d_%H%M%S)"
+
+          if [ -n "$PASS" ]; then
+            7z a -p"$PASS" -mhe=on -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" *
+          else
+            7z a -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" *
+          fi
+
+          if [ -f "${ARCHIVE_BASE}.7z.001" ] && [ ! -f "${ARCHIVE_BASE}.7z.002" ]; then
+            mv "${ARCHIVE_BASE}.7z.001" "${ARCHIVE_BASE}.7z"
+          fi
+
+          echo "archive_name=${ARCHIVE_BASE}" >> "$GITHUB_OUTPUT"
+          cd ..
+
+      - name: Get Current Date
+        id: get_date
+        shell: bash
+        run: |
+          echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_OUTPUT"
+
+      - name: Push to Repository
+        if: github.event.inputs.upload_method == 'repository'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p downloads
+
+          mv temp_dl/* downloads/ 2>/dev/null || true
+
+          git add downloads/
+
+          git commit -m "Batch Download: ${{ steps.download.outputs.downloaded_count }} files [skip ci]" || echo "Nothing to commit"
+
+          git push
+
+      - name: Upload to GitHub Releases
+        if: github.event.inputs.upload_method == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('batch-{0}', github.run_number) }}
+          name: Batch Download Release
+          body: |
+            Batch multi-file download completed.
+            
+            Files downloaded: ${{ steps.download.outputs.downloaded_count }}
+            Date: ${{ steps.get_date.outputs.date }}
+          files: temp_dl/*
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf temp_dl urls.txt
